@@ -1,6 +1,8 @@
 package com.fc.v2.service.impl;
 
 import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
@@ -21,8 +23,15 @@ import com.fc.v2.service.ITToponBoundLineService;
 @Service
 public class TToponBoundLineServiceImpl implements ITToponBoundLineService {
 
-    /** 优先级降序；并列按 ruleCode 降序（确定性） */
-    private static final Comparator<TToponBoundLine> PRIORITY_THEN_CODE_DESC = new Comparator<TToponBoundLine>() {
+    /** 线的情形：当家 */
+    private static final int STATUS_ACTIVE = 0;
+    private static final int DEL_FLAG_NORMAL = 0;
+
+    /**
+     * 取用顺位：优先级降序；并列按 ruleCode 降序（确定性）。
+     * 定位、取最高、列表、计数四处一律走这一把尺，不得各判各的。
+     */
+    private static final Comparator<TToponBoundLine> PRIORITY_DESC = new Comparator<TToponBoundLine>() {
         @Override
         public int compare(TToponBoundLine a, TToponBoundLine b) {
             int pa = a.getPriority() == null ? 0 : a.getPriority();
@@ -39,26 +48,30 @@ public class TToponBoundLineServiceImpl implements ITToponBoundLineService {
     @javax.annotation.Resource
     private TToponBoundLineMapper toponBoundLineMapper;
 
-    /**
-     * 时段比较统一走**墙钟字符串**（yyyy-MM-dd HH:mm:ss）+ 字符串绑定：
-     * JDBC 的 serverTimezone 与本机时区不对称，直接把 java.util.Date 作参数会整体偏移，
-     * 使边界判定在"切换当日"这类用例上随机错档（实测踩到）。
-     */
-    private static String ts(Date d) {
-        return new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(d);
-    }
-
     @Override
     public TToponBoundLine selectTToponBoundLineById(Long id) {
+        if (id == null) {
+            return null;
+        }
         return this.toponBoundLineMapper.selectById(id);
     }
 
     @Override
     public List<TToponBoundLine> listAvailable(Date at) {
         if (at == null) {
-            return new java.util.ArrayList<TToponBoundLine>();
+            return new ArrayList<TToponBoundLine>();
         }
-        return this.toponBoundLineMapper.selectList(new QueryWrapper<TToponBoundLine>().eq("del_flag", 0));
+        List<TToponBoundLine> all = this.toponBoundLineMapper.selectList(new QueryWrapper<TToponBoundLine>()
+                .eq("del_flag", DEL_FLAG_NORMAL)
+                .eq("status", STATUS_ACTIVE));
+        List<TToponBoundLine> hit = new ArrayList<TToponBoundLine>();
+        for (TToponBoundLine r : all) {
+            if (effectiveAt(r, at)) {
+                hit.add(r);
+            }
+        }
+        Collections.sort(hit, PRIORITY_DESC);
+        return hit;
     }
 
     @Override
@@ -67,6 +80,9 @@ public class TToponBoundLineServiceImpl implements ITToponBoundLineService {
             return 0;
         }
         TToponBoundLine rule = findRule(ruleCode, at);
+        if (rule == null) {
+            return 0;
+        }
         return levelOf(rule, input);
     }
 
@@ -91,58 +107,79 @@ public class TToponBoundLineServiceImpl implements ITToponBoundLineService {
         if (id == null || at == null) {
             return false;
         }
-        TToponBoundLine r = this.toponBoundLineMapper.selectById(id);
-        return r != null;
+        return effectiveAt(this.toponBoundLineMapper.selectById(id), at);
     }
 
     @Override
     public int countAvailable(Date at) {
-        if (at == null) {
-            return 0;
-        }
-        return this.toponBoundLineMapper
-                .selectList(new QueryWrapper<TToponBoundLine>().eq("del_flag", 0)).size();
+        return listAvailable(at).size();
     }
 
+    /**
+     * 是否被一条基准的生效区间罩住，定位/列表/取用/计数共一份判据：
+     * 未删除、当家（status=0），且 at 落在 [effStart, effEnd) 内——前闭后开，
+     * 启用日为空视为自古有之，交棒日为空视为长交，交棒日当天起归新基准，
+     * 交接当日新旧两条不会一齐命中。
+     */
+    private boolean effectiveAt(TToponBoundLine r, Date at) {
+        if (r == null || at == null) {
+            return false;
+        }
+        if (r.getDelFlag() != null && r.getDelFlag() != DEL_FLAG_NORMAL) {
+            return false;
+        }
+        if (r.getStatus() != null && r.getStatus() != STATUS_ACTIVE) {
+            return false;
+        }
+        if (r.getEffStart() != null && at.before(r.getEffStart())) {
+            return false;
+        }
+        if (r.getEffEnd() != null && !at.before(r.getEffEnd())) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * 按 ruleCode 定位 at 时刻的生效版本。区间前闭后开，正常数据同一时刻至多一条；
+     * 若数据异常出现交叠，按取用顺位取最高者（与 evaluateTop 同一把尺），
+     * 而不是照库里返回的自然次序碰运气。
+     */
     private TToponBoundLine findRule(String ruleCode, Date at) {
         List<TToponBoundLine> hit = this.toponBoundLineMapper.selectList(new QueryWrapper<TToponBoundLine>()
-                .eq("del_flag", 0).eq("rule_code", ruleCode));
-        TToponBoundLine newest = null;
+                .eq("del_flag", DEL_FLAG_NORMAL)
+                .eq("status", STATUS_ACTIVE)
+                .eq("rule_code", ruleCode));
+        TToponBoundLine picked = null;
         for (TToponBoundLine r : hit) {
-            if (newest == null || r.getEffEnd() == null) {
-                newest = r;
-            } else if (newest.getEffEnd() != null && r.getEffEnd().after(newest.getEffEnd())) {
-                newest = r;
+            if (!effectiveAt(r, at)) {
+                continue;
+            }
+            if (picked == null || PRIORITY_DESC.compare(r, picked) < 0) {
+                picked = r;
             }
         }
-        return newest;
+        return picked;
     }
 
-    /** 阈值解析：档案为主、明细覆盖；两者皆缺返回 null（调用方按不可用处理），精度统一 2 位 */
-    private BigDecimal resolveLimit(TToponBoundLine r, int tier) {
-        if (tier == 1) {
-            return r.getTh1Max();
-        }
-        if (tier == 2) {
-            return r.getTh2Max();
-        }
-        return r.getTh3Max();
-    }
-
-    /** 档案级默认阈值（明细未维护时的回退来源） */
-    private BigDecimal defaultThreshold(TToponBoundLine r, int tier) {
-        return r.getTh1Max();
-    }
-
-    /** 分档：等于上限取高一档 */
+    /**
+     * 分档：恰顶到上限的升一档（input 等于 thN_max 时归第 N+1 档）。
+     * 阈值一律判空，全未维护时返回 0，由调用方按不可用处理。
+     */
     private int levelOf(TToponBoundLine rule, BigDecimal input) {
-        if (rule.getTh1Max() != null && input.compareTo(rule.getTh1Max()) <= 0) {
+        if (rule == null || input == null) {
+            return 0;
+        }
+        if (rule.getTh1Max() == null && rule.getTh2Max() == null && rule.getTh3Max() == null) {
+            return 0;
+        }
+        if (rule.getTh1Max() != null && input.compareTo(rule.getTh1Max()) < 0) {
             return 1;
         }
-        if (rule.getTh2Max() != null && input.compareTo(rule.getTh2Max()) <= 0) {
+        if (rule.getTh2Max() != null && input.compareTo(rule.getTh2Max()) < 0) {
             return 2;
         }
-        if (rule.getTh3Max() != null && input.compareTo(rule.getTh3Max()) <= 0) {
+        if (rule.getTh3Max() != null && input.compareTo(rule.getTh3Max()) < 0) {
             return 3;
         }
         return 4;
